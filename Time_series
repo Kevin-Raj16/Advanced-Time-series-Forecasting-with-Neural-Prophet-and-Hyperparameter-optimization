@@ -1,1 +1,702 @@
-abcd
+# cell 1 (updated)
+import os
+import warnings
+warnings.filterwarnings("ignore")
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from math import sqrt
+from tqdm import tqdm
+
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+
+# NeuralProphet + Optuna
+try:
+    from neuralprophet import NeuralProphet
+except Exception as e:
+    raise ImportError("NeuralProphet import failed. Install `neuralprophet` in this environment.") from e
+
+try:
+    import optuna
+    from optuna.samplers import TPESampler
+except Exception as e:
+    raise ImportError("Optuna import failed. Install `optuna` in this environment.") from e
+
+# SARIMAX baseline
+import statsmodels.api as sm
+
+# reproducibility
+RANDOM_SEED = 42
+np.random.seed(RANDOM_SEED)
+
+# helper metrics
+def mape(y_true, y_pred):
+    y_true = np.array(y_true, dtype=float)
+    y_pred = np.array(y_pred, dtype=float)
+    # avoid division by zero: mask zero true values
+    mask = y_true != 0
+    if mask.sum() == 0:
+        return np.nan
+    return (np.abs((y_true[mask] - y_pred[mask]) / y_true[mask]).mean()) * 100
+
+
+# cell 2 (updated)
+import os
+from pathlib import Path
+import pandas as pd
+import matplotlib.pyplot as plt
+
+print("Notebook working directory:", os.getcwd())
+print("\nFiles in current folder:")
+for p in sorted(Path('.').iterdir()):
+    print(" ", p.name)
+
+# Prefer 'data.csv' if present, otherwise pick first CSV in folder
+preferred = Path("data.csv")
+csv_path = None
+if preferred.exists():
+    csv_path = preferred
+else:
+    csvs = list(Path('.').glob("*.csv"))
+    if csvs:
+        csv_path = csvs[0]
+
+if csv_path is None:
+    raise FileNotFoundError("No CSV found in the current notebook folder. Please upload 'data.csv' or place your file here.")
+
+csv_path = str(csv_path)
+print(f"\nLoading CSV: {csv_path}\n")
+df = pd.read_csv(csv_path)
+
+print("Raw preview (first 6 rows):")
+display(df.head(6))
+
+# Standardize column names detection (same logic as before)
+date_candidates = ['ds', 'date', 'datetime', 'time', 'timestamp']
+value_candidates = ['y', 'value', 'values', 'close', 'price', 'amount', 'count']
+
+date_col = None
+value_col = None
+for c in df.columns:
+    if c.lower() in date_candidates and date_col is None:
+        date_col = c
+    if c.lower() in value_candidates and value_col is None:
+        value_col = c
+
+# heuristic if not found
+if date_col is None:
+    for c in df.columns:
+        try:
+            parsed = pd.to_datetime(df[c], errors='coerce')
+            if parsed.notna().sum() / max(1, len(parsed)) > 0.5:
+                date_col = c
+                break
+        except Exception:
+            continue
+
+if value_col is None:
+    numeric_scores = {}
+    for c in df.columns:
+        numeric_scores[c] = pd.to_numeric(df[c], errors='coerce').notna().sum()
+    sorted_cols = sorted(numeric_scores.items(), key=lambda x: x[1], reverse=True)
+    for c, score in sorted_cols:
+        if c != date_col and score > 0:
+            value_col = c
+            break
+
+if date_col is None or value_col is None:
+    raise ValueError(f"Couldn't detect date and value columns. Detected: date_col={date_col}, value_col={value_col}")
+
+# rename to ds and y
+if date_col != 'ds' or value_col != 'y':
+    print(f"\nRenaming detected columns -> ds: '{date_col}'  ,  y: '{value_col}'")
+    df = df.rename(columns={date_col: 'ds', value_col: 'y'})
+
+# coerce and drop invalid rows
+df['ds'] = pd.to_datetime(df['ds'], errors='coerce')
+before = len(df)
+df = df.dropna(subset=['ds', 'y']).reset_index(drop=True)
+after = len(df)
+dropped = before - after
+if dropped:
+    print(f"\nDropped {dropped} rows with missing/invalid dates or values.")
+
+# sort by time
+df = df.sort_values('ds').reset_index(drop=True)
+
+# ensure y numeric
+if not pd.api.types.is_numeric_dtype(df['y']):
+    df['y'] = pd.to_numeric(df['y'], errors='coerce')
+    n_nan = df['y'].isna().sum()
+    print(f"After coercion, {n_nan} rows have non-numeric y (NaN). Dropping them.")
+    df = df.dropna(subset=['y']).reset_index(drop=True)
+
+# detect additional columns to treat as external regressors
+regressors = [c for c in df.columns if c not in ['ds', 'y']]
+print("\nDetected regressor columns (will be used if present):", regressors)
+
+# friendly preview
+print("\nFinal df head and dtypes:")
+display(df.head(6))
+print(df.dtypes)
+
+# try infer frequency
+try:
+    inferred = pd.infer_freq(df['ds'].iloc[:50])
+    print("\nInferred frequency (first 50 rows):", inferred)
+except Exception:
+    inferred = None
+    print("\nCould not infer fixed frequency automatically (timestamps may be irregular).")
+
+# quick plot
+plt.figure(figsize=(12,4))
+plt.plot(df['ds'], df['y'], marker='.', linewidth=1)
+plt.title('Time series (y)')
+plt.xlabel('ds')
+plt.ylabel('y')
+plt.grid(alpha=0.25)
+plt.show()
+
+
+
+# cell 3 (updated)
+# 80/20 split by time (no leakage)
+split_idx = int(len(df) * 0.8)
+split_date = df['ds'].iloc[split_idx]
+df_train = df[df['ds'] <= split_date].copy().reset_index(drop=True)
+df_test  = df[df['ds'] > split_date].copy().reset_index(drop=True)
+
+# fallback positional split if test empty
+if len(df_test) == 0:
+    df_train = df.iloc[:split_idx].copy().reset_index(drop=True)
+    df_test = df.iloc[split_idx:].copy().reset_index(drop=True)
+
+print('train len:', len(df_train), 'test len:', len(df_test))
+print("Train last ds:", df_train['ds'].iloc[-1] if len(df_train) else None)
+print("Test first ds:", df_test['ds'].iloc[0] if len(df_test) else None)
+
+# check regressors exist in both splits
+if len(regressors):
+    missing_in_train = [r for r in regressors if r not in df_train.columns]
+    missing_in_test  = [r for r in regressors if r not in df_test.columns]
+    if missing_in_train or missing_in_test:
+        print("Warning: regressors inconsistent across splits:", missing_in_train, missing_in_test)
+    else:
+        print("Regressors present in both train/test.")
+
+
+# cell 4 (fixed baseline predict with NumPy 2.0 monkey-patch)
+from math import sqrt
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+import pandas as pd
+import numpy as np
+
+# --- Monkey-patch for NumPy 2.0 compatibility with code expecting np.NaN ---
+# This creates np.NaN alias to np.nan if it doesn't exist (safe for notebook runtime).
+if not hasattr(np, "NaN"):
+    np.NaN = np.nan
+
+freq = inferred if (inferred is not None) else 'D'
+print("Using freq:", freq)
+
+# build baseline model
+m = NeuralProphet(
+    n_lags=0,
+    n_forecasts=1,
+    yearly_seasonality=True,
+    weekly_seasonality=True,
+    daily_seasonality=False,
+    epochs=50,
+)
+
+# register regressors (best-effort for different NP versions)
+for r in regressors:
+    try:
+        m.add_future_regressor(r)
+    except Exception:
+        try:
+            m.add_regressor(r)
+        except Exception:
+            print(f"Warning: couldn't register regressor {r} with NeuralProphet API.")
+
+print("Fitting baseline NeuralProphet...")
+m.fit(df_train, freq=freq)
+
+# === Build future_df that includes historic 'y' and np.nan for future rows ===
+train_part = df_train[['ds'] + (regressors if len(regressors) else []) + ['y']].copy()
+
+if len(regressors):
+    future_part = df_test[['ds'] + regressors].copy()
+else:
+    future_part = df_test[['ds']].copy()
+
+# explicit use of np.nan (not np.NaN) to avoid ambiguity
+future_part = future_part.assign(y=np.nan)
+
+# Concatenate historic + future so NP sees known y for history and NaN for horizon
+future_df = pd.concat([train_part, future_part], ignore_index=True)
+
+# Ensure ds is datetime and regressors numeric where appropriate
+future_df['ds'] = pd.to_datetime(future_df['ds'])
+for r in regressors:
+    if not pd.api.types.is_numeric_dtype(future_df[r]):
+        future_df[r] = pd.to_numeric(future_df[r], errors='coerce')
+
+# Predict
+try:
+    forecast = m.predict(future_df)
+except Exception as e:
+    # fallback: try to predict using df_test rows but still include 'y' column (np.nan)
+    print("Predict primary failed, trying fallback. Error:", repr(e))
+    fallback = df_test[['ds'] + (regressors if len(regressors) else [])].copy()
+    fallback['y'] = np.nan
+    fallback['ds'] = pd.to_datetime(fallback['ds'])
+    forecast = m.predict(fallback)
+
+# Align forecast and compute metrics
+forecast['ds'] = pd.to_datetime(forecast['ds']).dt.tz_localize(None)
+df_test_local = df_test.copy()
+df_test_local['ds'] = pd.to_datetime(df_test_local['ds']).dt.tz_localize(None)
+
+yhat_cols = [c for c in forecast.columns if c.startswith('yhat')]
+if not yhat_cols:
+    raise RuntimeError("No yhat columns produced by NeuralProphet. Columns: {}".format(forecast.columns.tolist()))
+pred_col = yhat_cols[0]
+print("Using prediction column:", pred_col)
+
+merged = pd.merge(df_test_local[['ds','y']], forecast[['ds', pred_col]], on='ds', how='left', validate='one_to_one')
+missing = merged[pred_col].isna().sum()
+if missing:
+    print(f"Warning: {missing} missing predictions after merge. Showing head:")
+    display(merged.head(10))
+
+merged = merged.dropna(subset=[pred_col]).reset_index(drop=True)
+if merged.empty:
+    raise RuntimeError("No aligned rows between baseline forecast and test set; cannot compute baseline metrics.")
+
+y_true = merged['y'].values
+y_pred = merged[pred_col].values
+rmse = sqrt(mean_squared_error(y_true, y_pred))
+mae = mean_absolute_error(y_true, y_pred)
+mape_val = mape(y_true, y_pred)
+
+print("Baseline NeuralProphet metrics -> RMSE: {:.4f}, MAE: {:.4f}, MAPE: {:.2f}%".format(rmse, mae, mape_val))
+
+
+# ------------------ FIXED CELL 5 (Optuna + CV) ------------------
+
+import inspect
+import optuna
+from optuna.samplers import TPESampler
+from math import sqrt
+from sklearn.metrics import mean_squared_error
+from neuralprophet import NeuralProphet
+import numpy as np
+import pandas as pd
+
+# ---- NumPy patch for NeuralProphet compatibility ----
+if not hasattr(np, "NaN"):
+    np.NaN = np.nan
+
+N_TRIALS = 12
+CV_FOLDS = 3
+
+# detect NeuralProphet params
+np_init_sig = inspect.signature(NeuralProphet.__init__)
+np_params = set(np_init_sig.parameters.keys())
+print("NeuralProphet init params available:", np_params)
+
+
+# ---------- TIME SERIES CROSS-VALIDATION SPLITS ----------
+def time_series_cv_splits(df_full, n_folds=3):
+    n = len(df_full)
+    fold_size = max(1, n // (n_folds + 1))
+    splits = []
+    for i in range(1, n_folds + 1):
+        train_end = fold_size * i
+        val_start = train_end
+        val_end = train_end + fold_size
+        if val_end > n:
+            val_end = n
+        train_df = df_full.iloc[:train_end].copy()
+        val_df = df_full.iloc[val_start:val_end].copy()
+        if len(val_df) > 0:
+            splits.append((train_df.reset_index(drop=True),
+                           val_df.reset_index(drop=True)))
+    return splits
+
+
+# ---------- OPTUNA OBJECTIVE ----------
+def objective(trial):
+    # Search space
+    params = {
+        "n_lags": trial.suggest_int("n_lags", 0, 8),
+        "n_forecasts": 1,
+        "epochs": trial.suggest_int("epochs", 20, 80),
+        "learning_rate": trial.suggest_float("learning_rate", 1e-4, 1e-2, log=True),
+        "batch_size": trial.suggest_categorical("batch_size", [8, 16, 32])
+    }
+
+    # Build init kwargs
+    init_kwargs = {k: v for k, v in params.items() if k in np_params}
+
+    # Get CV splits
+    splits = time_series_cv_splits(df_train, CV_FOLDS)
+    if not splits:
+        return 1e9
+
+    rmse_list = []
+
+    # ---------- Run expanding-window CV ----------
+    for tr, val in splits:
+        try:
+            m = NeuralProphet(**init_kwargs)
+
+            # Add regressors if present
+            for r in regressors:
+                try:
+                    m.add_future_regressor(r)
+                except Exception:
+                    try:
+                        m.add_regressor(r)
+                    except:
+                        pass
+
+            # ---- Fit model (NO verbose argument!) ----
+            m.fit(tr, freq=freq)
+
+            # ---- Build future df with y for history, NaN for future ----
+            tr_extended = tr.copy()
+            val_extended = val.copy()
+            val_extended["y"] = np.nan  # make future y = NaN
+
+            future_df = pd.concat([tr_extended, val_extended], ignore_index=True)
+
+            # Predict
+            fc = m.predict(future_df)
+
+            # Align using ds
+            fc["ds"] = pd.to_datetime(fc["ds"]).dt.tz_localize(None)
+            val_local = val.copy()
+            val_local["ds"] = pd.to_datetime(val_local["ds"]).dt.tz_localize(None)
+
+            yhat_cols = [c for c in fc.columns if c.startswith("yhat")]
+            if not yhat_cols:
+                return 1e9
+
+            pred_col = yhat_cols[0]
+
+            merged = pd.merge(
+                val_local[["ds", "y"]],
+                fc[["ds", pred_col]],
+                on="ds",
+                how="left"
+            )
+
+            merged = merged.dropna(subset=[pred_col])
+            if len(merged) == 0:
+                return 1e9
+
+            rmse_fold = sqrt(mean_squared_error(merged["y"], merged[pred_col]))
+            rmse_list.append(rmse_fold)
+
+        except Exception as e:
+            print("CV fold error:", repr(e))
+            return 1e9
+
+    return float(np.mean(rmse_list))
+
+
+# ---------- RUN OPTUNA ----------
+study = optuna.create_study(direction="minimize", sampler=TPESampler(seed=42))
+study.optimize(objective, n_trials=N_TRIALS)
+
+print("BEST params:", study.best_trial.params)
+print("BEST CV RMSE:", study.best_value)
+
+
+# ---------- Cell 6 (fixed refit + alignment; ensures 'y' present for historic rows) ----------
+import inspect
+import pandas as pd
+import matplotlib.pyplot as plt
+from math import sqrt
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+from neuralprophet import NeuralProphet
+import numpy as np
+
+# --- NumPy 2.0 compatibility patch (safe at runtime) ---
+if not hasattr(np, "NaN"):
+    np.NaN = np.nan
+
+# Ensure study exists
+if 'study' not in globals():
+    raise RuntimeError("Optuna `study` not found. Run Cell 5 first.")
+
+best_params = study.best_trial.params
+print("Raw best params from study:", best_params)
+
+# Inspect supported NeuralProphet init args
+np_init_sig = inspect.signature(NeuralProphet.__init__)
+np_params = set(np_init_sig.parameters.keys())
+
+# Map best_params to constructor-safe kwargs
+mapped = {}
+if 'n_lags' in best_params and 'n_lags' in np_params:
+    mapped['n_lags'] = int(best_params['n_lags'])
+if 'n_forecasts' in best_params and 'n_forecasts' in np_params:
+    mapped['n_forecasts'] = int(best_params['n_forecasts'])
+lr_val = best_params.get('learning_rate', best_params.get('lr', None))
+if lr_val is not None and 'learning_rate' in np_params:
+    mapped['learning_rate'] = float(lr_val)
+if 'batch_size' in best_params and 'batch_size' in np_params:
+    mapped['batch_size'] = int(best_params['batch_size'])
+if 'epochs' in best_params and 'epochs' in np_params:
+    mapped['epochs'] = int(best_params['epochs'])
+
+# Provide defaults if nothing mapped
+if not mapped:
+    print("No compatible params found in best_params — using safe defaults.")
+    mapped = dict(n_lags=3, n_forecasts=1, learning_rate=1e-3, batch_size=16, epochs=40)
+
+print("Mapped init kwargs to pass to NeuralProphet:", mapped)
+
+# Create and fit model
+m_best = NeuralProphet(**mapped)
+print("Registering regressors (if any)...")
+for r in regressors:
+    try:
+        m_best.add_future_regressor(r)
+    except Exception:
+        try:
+            m_best.add_regressor(r)
+        except Exception:
+            print(f"Warning: could not register regressor {r} with add_future_regressor/add_regressor.")
+
+print("Fitting model on full train set...")
+m_best.fit(df_train, freq=freq)
+
+# === Build future dataframe containing historic 'y' (train) and NaN 'y' (test),
+#     plus regressors for the horizon ===
+train_part = df_train[['ds'] + (regressors if len(regressors) else []) + ['y']].copy()
+
+if len(regressors):
+    future_part = df_test[['ds'] + regressors].copy()
+else:
+    future_part = df_test[['ds']].copy()
+
+# explicit use of np.nan for future y
+future_part = future_part.assign(y=np.nan)
+
+# concat historic + future
+future_df = pd.concat([train_part, future_part], ignore_index=True)
+
+# Ensure ds is datetime and regressors numeric where appropriate
+future_df['ds'] = pd.to_datetime(future_df['ds'])
+for r in regressors:
+    if not pd.api.types.is_numeric_dtype(future_df[r]):
+        future_df[r] = pd.to_numeric(future_df[r], errors='coerce')
+
+# Predict with robust fallback
+try:
+    forecast = m_best.predict(future_df)
+except Exception as e:
+    print("Primary predict failed, trying fallback predict (test-only rows). Error:", repr(e))
+    fallback = df_test[['ds'] + (regressors if len(regressors) else [])].copy()
+    fallback['y'] = np.nan
+    fallback['ds'] = pd.to_datetime(fallback['ds'])
+    forecast = m_best.predict(fallback)
+
+# Normalize/clean ds columns and detect yhat column
+forecast['ds'] = pd.to_datetime(forecast['ds']).dt.tz_localize(None)
+df_test_local = df_test.copy()
+df_test_local['ds'] = pd.to_datetime(df_test_local['ds']).dt.tz_localize(None)
+
+yhat_cols = [c for c in forecast.columns if c.startswith('yhat')]
+if not yhat_cols:
+    raise RuntimeError("No yhat columns found in forecast; columns: " + ", ".join(forecast.columns))
+pred_col = yhat_cols[0]
+print("Using prediction column:", pred_col)
+
+# Merge on ds to align predictions and truth (robust)
+merged = pd.merge(df_test_local[['ds','y']], forecast[['ds', pred_col]], on='ds', how='left', validate='one_to_one')
+print("Merged shape:", merged.shape)
+missing = merged[pred_col].isna().sum()
+if missing:
+    print(f"Warning: {missing} rows in df_test have no matching prediction. First few merged rows:")
+    display(merged.head(10))
+
+# Drop missing preds then compute metrics
+merged = merged.dropna(subset=[pred_col]).reset_index(drop=True)
+if merged.empty:
+    raise RuntimeError("No aligned rows after merging -> cannot compute metrics.")
+
+y_true = merged['y'].values
+y_pred = merged[pred_col].values
+
+if len(y_true) != len(y_pred):
+    raise ValueError(f"Length mismatch after merge: truth {len(y_true)} vs pred {len(y_pred)}")
+
+rmse = sqrt(mean_squared_error(y_true, y_pred))
+mae = mean_absolute_error(y_true, y_pred)
+mape_val = mape(y_true, y_pred)
+print(f"Tuned NP RMSE: {rmse:.4f}   MAE: {mae:.4f}   MAPE: {mape_val:.2f}%")
+
+# Plot True vs Predicted
+plt.figure(figsize=(12,5))
+plt.plot(merged['ds'], y_true, label='True', marker='o', linewidth=1)
+plt.plot(merged['ds'], y_pred, label='Predicted', marker='o', linewidth=1)
+plt.legend()
+plt.title('NeuralProphet Tuned Forecast (aligned on ds)')
+plt.xlabel('ds')
+plt.ylabel('y')
+plt.grid(alpha=0.25)
+plt.show()
+
+# Save forecast with actuals for inspection
+out = pd.merge(forecast, df_test_local[['ds','y']], on='ds', how='left')
+out.to_csv("np_best_forecast_with_actuals.csv", index=False)
+print("Saved: np_best_forecast_with_actuals.csv")
+
+
+# cell 7 (SARIMAX baseline improved; uses exog if regressors exist)
+from math import sqrt
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+
+train_indexed = df_train.set_index('ds')['y']
+test_indexed = df_test.set_index('ds')['y']
+
+if len(regressors):
+    exog_train = df_train.set_index('ds')[regressors]
+    exog_test = df_test.set_index('ds')[regressors]
+else:
+    exog_train = None
+    exog_test = None
+
+order = (1,1,1)
+seasonal_order = (0,0,0,0)
+
+sarimax_model = sm.tsa.statespace.SARIMAX(train_indexed, exog=exog_train, order=order,
+                                         seasonal_order=seasonal_order,
+                                         enforce_stationarity=False,
+                                         enforce_invertibility=False)
+sarimax_res = sarimax_model.fit(disp=False)
+
+sarimax_fore = sarimax_res.get_forecast(steps=len(test_indexed), exog=exog_test)
+y_pred_sarimax = sarimax_fore.predicted_mean.values
+
+# align to test ds
+sarimax_df = pd.DataFrame({'ds': test_indexed.index, 'y_pred': y_pred_sarimax})
+sarimax_df['ds'] = pd.to_datetime(sarimax_df['ds']).dt.tz_localize(None)
+df_test_local = df_test.copy()
+df_test_local['ds'] = pd.to_datetime(df_test_local['ds']).dt.tz_localize(None)
+
+merged_sarimax = pd.merge(df_test_local[['ds','y']], sarimax_df, on='ds', how='left', validate='one_to_one')
+merged_sarimax = merged_sarimax.dropna(subset=['y_pred']).reset_index(drop=True)
+
+rmse_sarimax = sqrt(mean_squared_error(merged_sarimax['y'], merged_sarimax['y_pred']))
+mae_sarimax = mean_absolute_error(merged_sarimax['y'], merged_sarimax['y_pred'])
+mape_sarimax = mape(merged_sarimax['y'], merged_sarimax['y_pred'])
+
+print("SARIMAX metrics -> RMSE: {:.4f}, MAE: {:.4f}, MAPE: {:.2f}%".format(rmse_sarimax, mae_sarimax, mape_sarimax))
+
+plt.figure(figsize=(12,5))
+plt.plot(df_test_local['ds'], df_test_local['y'], label='true')
+plt.plot(merged_sarimax['ds'], merged_sarimax['y_pred'], label='sarimax_pred')
+plt.legend()
+plt.title('SARIMAX vs True on test')
+plt.show()
+
+
+# cell 8 (diagnostics + residual analysis + short report)
+import pandas as pd
+import matplotlib.pyplot as plt
+from math import sqrt
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+from statsmodels.graphics.tsaplots import plot_acf
+import json
+
+# Ensure forecast exists
+if 'forecast' not in globals():
+    raise RuntimeError("No forecast found. Run the tuned model cell (Cell 6) first.")
+
+# Merge tuned predictions and compute residuals (we computed merged earlier; recompute to be safe)
+forecast_local = forecast.copy()
+forecast_local['ds'] = pd.to_datetime(forecast_local['ds']).dt.tz_localize(None)
+df_test_local = df_test.copy()
+df_test_local['ds'] = pd.to_datetime(df_test_local['ds']).dt.tz_localize(None)
+
+yhat_cols = [c for c in forecast_local.columns if c.startswith('yhat')]
+pred_col = yhat_cols[0] if yhat_cols else None
+if not pred_col:
+    raise RuntimeError("No prediction column in forecast for diagnostics.")
+
+merged = pd.merge(df_test_local[['ds','y']], forecast_local[['ds', pred_col]], on='ds', how='left', validate='one_to_one')
+aligned = merged.dropna(subset=[pred_col]).reset_index(drop=True)
+print("Aligned rows for diagnostics:", len(aligned))
+
+if len(aligned) == 0:
+    print("No aligned rows between tuned forecast and test set. Check timezone/frequency issues. Diagnostic CSVs saved.")
+    forecast_local.to_csv("diagnostic_forecast.csv", index=False)
+    merged.to_csv("diagnostic_merged.csv", index=False)
+else:
+    aligned['residual'] = aligned['y'] - aligned[pred_col]
+    rmse_al = sqrt(mean_squared_error(aligned['y'], aligned[pred_col]))
+    mae_al = mean_absolute_error(aligned['y'], aligned[pred_col])
+    mape_al = mape(aligned['y'], aligned[pred_col])
+
+    print("Aligned tuned model -> RMSE: {:.4f}, MAE: {:.4f}, MAPE: {:.2f}%".format(rmse_al, mae_al, mape_al))
+
+    # residual plot
+    plt.figure(figsize=(12,4))
+    plt.plot(aligned['ds'], aligned['residual'], marker='.')
+    plt.axhline(0, color='k', linewidth=0.5)
+    plt.title('Residuals over time (tuned model)')
+    plt.show()
+
+    # residual histogram
+    plt.figure(figsize=(6,4))
+    plt.hist(aligned['residual'], bins=30)
+    plt.title('Residual distribution')
+    plt.show()
+
+    # ACF
+    n_lags = min(40, max(1, len(aligned['residual'])//2))
+    if n_lags >= 2:
+        plot_acf(aligned['residual'].values, lags=n_lags)
+        plt.show()
+
+    # Save residuals for inspection
+    aligned.to_csv("tuned_aligned_with_residuals.csv", index=False)
+    print("Saved: tuned_aligned_with_residuals.csv")
+
+# Short textual report summarizing dataset + metrics + best params
+report = {
+    'dataset_rows': len(df),
+    'train_rows': len(df_train),
+    'test_rows': len(df_test),
+    'regressors': regressors,
+    'freq_used': freq,
+    'baseline_np_metrics': {
+        'rmse': float(rmse) if 'rmse' in globals() else None,
+        'mae': float(mae) if 'mae' in globals() else None,
+        'mape': float(mape_val) if 'mape_val' in globals() else None
+    },
+    'tuned_np_metrics': {
+        'rmse': float(rmse) if 'rmse' in globals() else None,
+        'mae': float(mae) if 'mae' in globals() else None,
+        'mape': float(mape_val) if 'mape_val' in globals() else None
+    },
+    'sarimax_metrics': {
+        'rmse': float(rmse_sarimax) if 'rmse_sarimax' in globals() else None,
+        'mae': float(mae_sarimax) if 'mae_sarimax' in globals() else None,
+        'mape': float(mape_sarimax) if 'mape_sarimax' in globals() else None
+    },
+    'best_params': study.best_trial.params if 'study' in globals() else None
+}
+
+with open("short_report.json","w") as f:
+    json.dump(report, f, indent=2, default=str)
+print("Saved: short_report.json (summary of dataset and metrics)")
+print("You can review np_best_forecast_with_actuals.csv, np_components.csv (if present), tuned_aligned_with_residuals.csv, and short_report.json for deliverables.")
+
