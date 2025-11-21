@@ -1,4 +1,4 @@
-# cell 1 (updated)
+
 import os
 import warnings
 warnings.filterwarnings("ignore")
@@ -11,7 +11,7 @@ from tqdm import tqdm
 
 from sklearn.metrics import mean_squared_error, mean_absolute_error
 
-# NeuralProphet + Optuna
+
 try:
     from neuralprophet import NeuralProphet
 except Exception as e:
@@ -23,25 +23,23 @@ try:
 except Exception as e:
     raise ImportError("Optuna import failed. Install `optuna` in this environment.") from e
 
-# SARIMAX baseline
+
 import statsmodels.api as sm
 
-# reproducibility
 RANDOM_SEED = 42
 np.random.seed(RANDOM_SEED)
 
-# helper metrics
 def mape(y_true, y_pred):
     y_true = np.array(y_true, dtype=float)
     y_pred = np.array(y_pred, dtype=float)
-    # avoid division by zero: mask zero true values
+
     mask = y_true != 0
     if mask.sum() == 0:
         return np.nan
     return (np.abs((y_true[mask] - y_pred[mask]) / y_true[mask]).mean()) * 100
 
 
-# cell 2 (updated)
+
 import os
 from pathlib import Path
 import pandas as pd
@@ -52,7 +50,6 @@ print("\nFiles in current folder:")
 for p in sorted(Path('.').iterdir()):
     print(" ", p.name)
 
-# Prefer 'data.csv' if present, otherwise pick first CSV in folder
 preferred = Path("data.csv")
 csv_path = None
 if preferred.exists():
@@ -72,7 +69,6 @@ df = pd.read_csv(csv_path)
 print("Raw preview (first 6 rows):")
 display(df.head(6))
 
-# Standardize column names detection (same logic as before)
 date_candidates = ['ds', 'date', 'datetime', 'time', 'timestamp']
 value_candidates = ['y', 'value', 'values', 'close', 'price', 'amount', 'count']
 
@@ -84,7 +80,6 @@ for c in df.columns:
     if c.lower() in value_candidates and value_col is None:
         value_col = c
 
-# heuristic if not found
 if date_col is None:
     for c in df.columns:
         try:
@@ -108,12 +103,10 @@ if value_col is None:
 if date_col is None or value_col is None:
     raise ValueError(f"Couldn't detect date and value columns. Detected: date_col={date_col}, value_col={value_col}")
 
-# rename to ds and y
 if date_col != 'ds' or value_col != 'y':
     print(f"\nRenaming detected columns -> ds: '{date_col}'  ,  y: '{value_col}'")
     df = df.rename(columns={date_col: 'ds', value_col: 'y'})
 
-# coerce and drop invalid rows
 df['ds'] = pd.to_datetime(df['ds'], errors='coerce')
 before = len(df)
 df = df.dropna(subset=['ds', 'y']).reset_index(drop=True)
@@ -122,26 +115,22 @@ dropped = before - after
 if dropped:
     print(f"\nDropped {dropped} rows with missing/invalid dates or values.")
 
-# sort by time
 df = df.sort_values('ds').reset_index(drop=True)
 
-# ensure y numeric
+
 if not pd.api.types.is_numeric_dtype(df['y']):
     df['y'] = pd.to_numeric(df['y'], errors='coerce')
     n_nan = df['y'].isna().sum()
     print(f"After coercion, {n_nan} rows have non-numeric y (NaN). Dropping them.")
     df = df.dropna(subset=['y']).reset_index(drop=True)
 
-# detect additional columns to treat as external regressors
 regressors = [c for c in df.columns if c not in ['ds', 'y']]
 print("\nDetected regressor columns (will be used if present):", regressors)
 
-# friendly preview
 print("\nFinal df head and dtypes:")
 display(df.head(6))
 print(df.dtypes)
 
-# try infer frequency
 try:
     inferred = pd.infer_freq(df['ds'].iloc[:50])
     print("\nInferred frequency (first 50 rows):", inferred)
@@ -149,7 +138,6 @@ except Exception:
     inferred = None
     print("\nCould not infer fixed frequency automatically (timestamps may be irregular).")
 
-# quick plot
 plt.figure(figsize=(12,4))
 plt.plot(df['ds'], df['y'], marker='.', linewidth=1)
 plt.title('Time series (y)')
@@ -160,14 +148,11 @@ plt.show()
 
 
 
-# cell 3 (updated)
-# 80/20 split by time (no leakage)
 split_idx = int(len(df) * 0.8)
 split_date = df['ds'].iloc[split_idx]
 df_train = df[df['ds'] <= split_date].copy().reset_index(drop=True)
 df_test  = df[df['ds'] > split_date].copy().reset_index(drop=True)
 
-# fallback positional split if test empty
 if len(df_test) == 0:
     df_train = df.iloc[:split_idx].copy().reset_index(drop=True)
     df_test = df.iloc[split_idx:].copy().reset_index(drop=True)
@@ -176,7 +161,6 @@ print('train len:', len(df_train), 'test len:', len(df_test))
 print("Train last ds:", df_train['ds'].iloc[-1] if len(df_train) else None)
 print("Test first ds:", df_test['ds'].iloc[0] if len(df_test) else None)
 
-# check regressors exist in both splits
 if len(regressors):
     missing_in_train = [r for r in regressors if r not in df_train.columns]
     missing_in_test  = [r for r in regressors if r not in df_test.columns]
@@ -186,21 +170,17 @@ if len(regressors):
         print("Regressors present in both train/test.")
 
 
-# cell 4 (fixed baseline predict with NumPy 2.0 monkey-patch)
 from math import sqrt
 from sklearn.metrics import mean_squared_error, mean_absolute_error
 import pandas as pd
 import numpy as np
 
-# --- Monkey-patch for NumPy 2.0 compatibility with code expecting np.NaN ---
-# This creates np.NaN alias to np.nan if it doesn't exist (safe for notebook runtime).
 if not hasattr(np, "NaN"):
     np.NaN = np.nan
 
 freq = inferred if (inferred is not None) else 'D'
 print("Using freq:", freq)
 
-# build baseline model
 m = NeuralProphet(
     n_lags=0,
     n_forecasts=1,
@@ -210,7 +190,6 @@ m = NeuralProphet(
     epochs=50,
 )
 
-# register regressors (best-effort for different NP versions)
 for r in regressors:
     try:
         m.add_future_regressor(r)
@@ -223,7 +202,6 @@ for r in regressors:
 print("Fitting baseline NeuralProphet...")
 m.fit(df_train, freq=freq)
 
-# === Build future_df that includes historic 'y' and np.nan for future rows ===
 train_part = df_train[['ds'] + (regressors if len(regressors) else []) + ['y']].copy()
 
 if len(regressors):
@@ -231,30 +209,25 @@ if len(regressors):
 else:
     future_part = df_test[['ds']].copy()
 
-# explicit use of np.nan (not np.NaN) to avoid ambiguity
 future_part = future_part.assign(y=np.nan)
 
-# Concatenate historic + future so NP sees known y for history and NaN for horizon
 future_df = pd.concat([train_part, future_part], ignore_index=True)
 
-# Ensure ds is datetime and regressors numeric where appropriate
 future_df['ds'] = pd.to_datetime(future_df['ds'])
 for r in regressors:
     if not pd.api.types.is_numeric_dtype(future_df[r]):
         future_df[r] = pd.to_numeric(future_df[r], errors='coerce')
 
-# Predict
+
 try:
     forecast = m.predict(future_df)
 except Exception as e:
-    # fallback: try to predict using df_test rows but still include 'y' column (np.nan)
     print("Predict primary failed, trying fallback. Error:", repr(e))
     fallback = df_test[['ds'] + (regressors if len(regressors) else [])].copy()
     fallback['y'] = np.nan
     fallback['ds'] = pd.to_datetime(fallback['ds'])
     forecast = m.predict(fallback)
 
-# Align forecast and compute metrics
 forecast['ds'] = pd.to_datetime(forecast['ds']).dt.tz_localize(None)
 df_test_local = df_test.copy()
 df_test_local['ds'] = pd.to_datetime(df_test_local['ds']).dt.tz_localize(None)
@@ -284,8 +257,6 @@ mape_val = mape(y_true, y_pred)
 print("Baseline NeuralProphet metrics -> RMSE: {:.4f}, MAE: {:.4f}, MAPE: {:.2f}%".format(rmse, mae, mape_val))
 
 
-# ------------------ FIXED CELL 5 (Optuna + CV) ------------------
-
 import inspect
 import optuna
 from optuna.samplers import TPESampler
@@ -295,20 +266,18 @@ from neuralprophet import NeuralProphet
 import numpy as np
 import pandas as pd
 
-# ---- NumPy patch for NeuralProphet compatibility ----
 if not hasattr(np, "NaN"):
     np.NaN = np.nan
 
 N_TRIALS = 12
 CV_FOLDS = 3
 
-# detect NeuralProphet params
+
 np_init_sig = inspect.signature(NeuralProphet.__init__)
 np_params = set(np_init_sig.parameters.keys())
 print("NeuralProphet init params available:", np_params)
 
 
-# ---------- TIME SERIES CROSS-VALIDATION SPLITS ----------
 def time_series_cv_splits(df_full, n_folds=3):
     n = len(df_full)
     fold_size = max(1, n // (n_folds + 1))
@@ -327,9 +296,9 @@ def time_series_cv_splits(df_full, n_folds=3):
     return splits
 
 
-# ---------- OPTUNA OBJECTIVE ----------
+
 def objective(trial):
-    # Search space
+
     params = {
         "n_lags": trial.suggest_int("n_lags", 0, 8),
         "n_forecasts": 1,
@@ -338,22 +307,18 @@ def objective(trial):
         "batch_size": trial.suggest_categorical("batch_size", [8, 16, 32])
     }
 
-    # Build init kwargs
+
     init_kwargs = {k: v for k, v in params.items() if k in np_params}
 
-    # Get CV splits
     splits = time_series_cv_splits(df_train, CV_FOLDS)
     if not splits:
         return 1e9
 
     rmse_list = []
 
-    # ---------- Run expanding-window CV ----------
     for tr, val in splits:
         try:
             m = NeuralProphet(**init_kwargs)
-
-            # Add regressors if present
             for r in regressors:
                 try:
                     m.add_future_regressor(r)
@@ -362,21 +327,18 @@ def objective(trial):
                         m.add_regressor(r)
                     except:
                         pass
-
-            # ---- Fit model (NO verbose argument!) ----
             m.fit(tr, freq=freq)
 
-            # ---- Build future df with y for history, NaN for future ----
             tr_extended = tr.copy()
             val_extended = val.copy()
             val_extended["y"] = np.nan  # make future y = NaN
 
             future_df = pd.concat([tr_extended, val_extended], ignore_index=True)
 
-            # Predict
+
             fc = m.predict(future_df)
 
-            # Align using ds
+     
             fc["ds"] = pd.to_datetime(fc["ds"]).dt.tz_localize(None)
             val_local = val.copy()
             val_local["ds"] = pd.to_datetime(val_local["ds"]).dt.tz_localize(None)
@@ -408,7 +370,7 @@ def objective(trial):
     return float(np.mean(rmse_list))
 
 
-# ---------- RUN OPTUNA ----------
+
 study = optuna.create_study(direction="minimize", sampler=TPESampler(seed=42))
 study.optimize(objective, n_trials=N_TRIALS)
 
@@ -416,7 +378,7 @@ print("BEST params:", study.best_trial.params)
 print("BEST CV RMSE:", study.best_value)
 
 
-# ---------- Cell 6 (fixed refit + alignment; ensures 'y' present for historic rows) ----------
+
 import inspect
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -425,22 +387,20 @@ from sklearn.metrics import mean_squared_error, mean_absolute_error
 from neuralprophet import NeuralProphet
 import numpy as np
 
-# --- NumPy 2.0 compatibility patch (safe at runtime) ---
 if not hasattr(np, "NaN"):
     np.NaN = np.nan
 
-# Ensure study exists
 if 'study' not in globals():
     raise RuntimeError("Optuna `study` not found. Run Cell 5 first.")
 
 best_params = study.best_trial.params
 print("Raw best params from study:", best_params)
 
-# Inspect supported NeuralProphet init args
+
 np_init_sig = inspect.signature(NeuralProphet.__init__)
 np_params = set(np_init_sig.parameters.keys())
 
-# Map best_params to constructor-safe kwargs
+
 mapped = {}
 if 'n_lags' in best_params and 'n_lags' in np_params:
     mapped['n_lags'] = int(best_params['n_lags'])
@@ -454,14 +414,12 @@ if 'batch_size' in best_params and 'batch_size' in np_params:
 if 'epochs' in best_params and 'epochs' in np_params:
     mapped['epochs'] = int(best_params['epochs'])
 
-# Provide defaults if nothing mapped
 if not mapped:
     print("No compatible params found in best_params — using safe defaults.")
     mapped = dict(n_lags=3, n_forecasts=1, learning_rate=1e-3, batch_size=16, epochs=40)
 
 print("Mapped init kwargs to pass to NeuralProphet:", mapped)
 
-# Create and fit model
 m_best = NeuralProphet(**mapped)
 print("Registering regressors (if any)...")
 for r in regressors:
