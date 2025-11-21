@@ -331,7 +331,7 @@ def objective(trial):
 
             tr_extended = tr.copy()
             val_extended = val.copy()
-            val_extended["y"] = np.nan  # make future y = NaN
+            val_extended["y"] = np.nan  
 
             future_df = pd.concat([tr_extended, val_extended], ignore_index=True)
 
@@ -434,8 +434,6 @@ for r in regressors:
 print("Fitting model on full train set...")
 m_best.fit(df_train, freq=freq)
 
-# === Build future dataframe containing historic 'y' (train) and NaN 'y' (test),
-#     plus regressors for the horizon ===
 train_part = df_train[['ds'] + (regressors if len(regressors) else []) + ['y']].copy()
 
 if len(regressors):
@@ -443,19 +441,15 @@ if len(regressors):
 else:
     future_part = df_test[['ds']].copy()
 
-# explicit use of np.nan for future y
 future_part = future_part.assign(y=np.nan)
 
-# concat historic + future
 future_df = pd.concat([train_part, future_part], ignore_index=True)
 
-# Ensure ds is datetime and regressors numeric where appropriate
 future_df['ds'] = pd.to_datetime(future_df['ds'])
 for r in regressors:
     if not pd.api.types.is_numeric_dtype(future_df[r]):
         future_df[r] = pd.to_numeric(future_df[r], errors='coerce')
 
-# Predict with robust fallback
 try:
     forecast = m_best.predict(future_df)
 except Exception as e:
@@ -465,7 +459,6 @@ except Exception as e:
     fallback['ds'] = pd.to_datetime(fallback['ds'])
     forecast = m_best.predict(fallback)
 
-# Normalize/clean ds columns and detect yhat column
 forecast['ds'] = pd.to_datetime(forecast['ds']).dt.tz_localize(None)
 df_test_local = df_test.copy()
 df_test_local['ds'] = pd.to_datetime(df_test_local['ds']).dt.tz_localize(None)
@@ -476,7 +469,6 @@ if not yhat_cols:
 pred_col = yhat_cols[0]
 print("Using prediction column:", pred_col)
 
-# Merge on ds to align predictions and truth (robust)
 merged = pd.merge(df_test_local[['ds','y']], forecast[['ds', pred_col]], on='ds', how='left', validate='one_to_one')
 print("Merged shape:", merged.shape)
 missing = merged[pred_col].isna().sum()
@@ -484,7 +476,6 @@ if missing:
     print(f"Warning: {missing} rows in df_test have no matching prediction. First few merged rows:")
     display(merged.head(10))
 
-# Drop missing preds then compute metrics
 merged = merged.dropna(subset=[pred_col]).reset_index(drop=True)
 if merged.empty:
     raise RuntimeError("No aligned rows after merging -> cannot compute metrics.")
@@ -500,7 +491,6 @@ mae = mean_absolute_error(y_true, y_pred)
 mape_val = mape(y_true, y_pred)
 print(f"Tuned NP RMSE: {rmse:.4f}   MAE: {mae:.4f}   MAPE: {mape_val:.2f}%")
 
-# Plot True vs Predicted
 plt.figure(figsize=(12,5))
 plt.plot(merged['ds'], y_true, label='True', marker='o', linewidth=1)
 plt.plot(merged['ds'], y_pred, label='Predicted', marker='o', linewidth=1)
@@ -511,13 +501,10 @@ plt.ylabel('y')
 plt.grid(alpha=0.25)
 plt.show()
 
-# Save forecast with actuals for inspection
 out = pd.merge(forecast, df_test_local[['ds','y']], on='ds', how='left')
 out.to_csv("np_best_forecast_with_actuals.csv", index=False)
 print("Saved: np_best_forecast_with_actuals.csv")
 
-
-# cell 7 (SARIMAX baseline improved; uses exog if regressors exist)
 from math import sqrt
 from sklearn.metrics import mean_squared_error, mean_absolute_error
 
@@ -543,7 +530,6 @@ sarimax_res = sarimax_model.fit(disp=False)
 sarimax_fore = sarimax_res.get_forecast(steps=len(test_indexed), exog=exog_test)
 y_pred_sarimax = sarimax_fore.predicted_mean.values
 
-# align to test ds
 sarimax_df = pd.DataFrame({'ds': test_indexed.index, 'y_pred': y_pred_sarimax})
 sarimax_df['ds'] = pd.to_datetime(sarimax_df['ds']).dt.tz_localize(None)
 df_test_local = df_test.copy()
@@ -565,8 +551,6 @@ plt.legend()
 plt.title('SARIMAX vs True on test')
 plt.show()
 
-
-# cell 8 (diagnostics + residual analysis + short report)
 import pandas as pd
 import matplotlib.pyplot as plt
 from math import sqrt
@@ -574,11 +558,10 @@ from sklearn.metrics import mean_squared_error, mean_absolute_error
 from statsmodels.graphics.tsaplots import plot_acf
 import json
 
-# Ensure forecast exists
+
 if 'forecast' not in globals():
     raise RuntimeError("No forecast found. Run the tuned model cell (Cell 6) first.")
 
-# Merge tuned predictions and compute residuals (we computed merged earlier; recompute to be safe)
 forecast_local = forecast.copy()
 forecast_local['ds'] = pd.to_datetime(forecast_local['ds']).dt.tz_localize(None)
 df_test_local = df_test.copy()
@@ -605,30 +588,25 @@ else:
 
     print("Aligned tuned model -> RMSE: {:.4f}, MAE: {:.4f}, MAPE: {:.2f}%".format(rmse_al, mae_al, mape_al))
 
-    # residual plot
     plt.figure(figsize=(12,4))
     plt.plot(aligned['ds'], aligned['residual'], marker='.')
     plt.axhline(0, color='k', linewidth=0.5)
     plt.title('Residuals over time (tuned model)')
     plt.show()
 
-    # residual histogram
     plt.figure(figsize=(6,4))
     plt.hist(aligned['residual'], bins=30)
     plt.title('Residual distribution')
     plt.show()
 
-    # ACF
     n_lags = min(40, max(1, len(aligned['residual'])//2))
     if n_lags >= 2:
         plot_acf(aligned['residual'].values, lags=n_lags)
         plt.show()
 
-    # Save residuals for inspection
     aligned.to_csv("tuned_aligned_with_residuals.csv", index=False)
     print("Saved: tuned_aligned_with_residuals.csv")
 
-# Short textual report summarizing dataset + metrics + best params
 report = {
     'dataset_rows': len(df),
     'train_rows': len(df_train),
